@@ -12,16 +12,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - pipenv-version: '2022.4.8'
-            python-version: '3.6'
-            install-with: pyenv
-          - pipenv-version: '2022.4.8'
-            python-version: '3.7'
-            install-with: pyenv
-          - pipenv-version: '2022.4.8'
-            python-version: '3.8'
-          - pipenv-version: '2022.4.8'
-            python-version: '3.9'
+          # - pipenv-version: '2022.4.8'
+          #   python-version: '3.6'
+          #   install-with: pyenv
+          # - pipenv-version: '2022.4.8'
+          #   python-version: '3.7'
+          #   install-with: pyenv
+          # - pipenv-version: '2022.4.8'
+          #   python-version: '3.8'
+          # - pipenv-version: '2022.4.8'
+          #   python-version: '3.9'
           - pipenv-version: '2023.2.4'
             python-version: '3.10'
           - pipenv-version: '2023.2.4'

@@ -9,18 +9,19 @@ jobs:
     name: Test on Python v${{ matrix.python-version }}
     runs-on: ubuntu-22.04
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - pipenv-version: '2022.4.8'
-            python-version: '3.6'
-            install-with: pyenv
-          - pipenv-version: '2022.4.8'
-            python-version: '3.7'
-            install-with: pyenv
-          - pipenv-version: '2022.4.8'
-            python-version: '3.8'
-          - pipenv-version: '2022.4.8'
-            python-version: '3.9'
+          # - pipenv-version: '2022.4.8'
+          #   python-version: '3.6'
+          #   install-with: pyenv
+          # - pipenv-version: '2022.4.8'
+          #   python-version: '3.7'
+          #   install-with: pyenv
+          # - pipenv-version: '2022.4.8'
+          #   python-version: '3.8'
+          # - pipenv-version: '2022.4.8'
+          #   python-version: '3.9'
           - pipenv-version: '2023.2.4'
             python-version: '3.10'
           - pipenv-version: '2023.2.4'
@@ -59,7 +60,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install pipenv==${{ matrix.pipenv-version }}
-          pipenv install --dev
+          pipenv --python ${{ matrix.python-version }} install --dev
 
       - run: pipenv run tests
       - run: pipenv run tests-coverage

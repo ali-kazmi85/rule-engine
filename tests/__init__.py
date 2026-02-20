@@ -31,6 +31,7 @@
 #
 
 from .ast import *
+from .async_support import *
 from .builtins import *
 from .engine import *
 from .errors import *

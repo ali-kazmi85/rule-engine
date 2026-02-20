@@ -30,16 +30,18 @@
 #  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
+import asyncio
 import binascii
 import collections
 import collections.abc
 import contextlib
+import contextvars
 import datetime
 import decimal
 import functools
+import inspect
 import math
 import re
-import threading
 
 from . import ast
 from . import builtins
@@ -50,9 +52,17 @@ from .types import DataType
 
 import dateutil.tz
 
-def _tls_getter(thread_local, key, _builtins):
-	# a function stub to be used with functools.partial for retrieving thread-local values
-	return getattr(thread_local.storage, key)
+def _tls_getter(cv, key, _builtins):
+	# a function stub to be used with functools.partial for retrieving context-var-backed values
+	state = cv.get(None)
+	if state is None:
+		return None
+	return getattr(state, key)
+
+async def _maybe_await(value):
+	if inspect.isawaitable(value):
+		return await value
+	return value
 
 def resolve_attribute(thing, name):
 	"""
@@ -476,13 +486,13 @@ class Context(object):
 				raise ValueError('unsupported timezone: ' + default_timezone)
 		elif not isinstance(default_timezone, datetime.tzinfo):
 			raise TypeError('invalid default_timezone type')
-		self._thread_local = threading.local()
+		self._cv = contextvars.ContextVar('rule_engine_state_{}'.format(id(self)))
 		self.default_timezone = default_timezone
 		"""The *default_timezone* parameter from :py:meth:`~__init__`"""
 		self.default_value = default_value
 		"""The *default_value* parameter from :py:meth:`~__init__`"""
 		self.builtins = builtins.Builtins.from_defaults(
-			values={'re_groups': builtins.BuiltinValueGenerator(functools.partial(_tls_getter, self._thread_local, 'regex_groups'))},
+			values={'re_groups': builtins.BuiltinValueGenerator(functools.partial(_tls_getter, self._cv, 'regex_groups'))},
 			value_types={'re_groups': ast.DataType.ARRAY(ast.DataType.STRING)},
 			timezone=default_timezone
 		)
@@ -511,9 +521,11 @@ class Context(object):
 
 	@property
 	def _tls(self):
-		if not hasattr(self._thread_local, 'storage'):
-			self._thread_local.storage = _ThreadLocalStorage()
-		return self._thread_local.storage
+		state = self._cv.get(None)
+		if state is None:
+			state = _ThreadLocalStorage()
+			self._cv.set(state)
+		return state
 
 	def resolve(self, thing, name, scope=None):
 		"""
@@ -538,6 +550,18 @@ class Context(object):
 				if name in assignments:
 					return assignments[name].value
 			return self.__resolver(thing, name)
+		raise errors.SymbolResolutionError(name, symbol_scope=scope, thing=thing)
+
+	async def resolve_async(self, thing, name, scope=None):
+		if scope == builtins.Builtins.scope_name:
+			thing = self.builtins
+		if isinstance(thing, builtins.Builtins):
+			return resolve_item(thing, name)
+		if scope is None:
+			for assignments in self._tls.assignment_scopes:
+				if name in assignments:
+					return assignments[name].value
+			return await _maybe_await(self.__resolver(thing, name))
 		raise errors.SymbolResolutionError(name, symbol_scope=scope, thing=thing)
 
 	__resolve_attribute = _AttributeResolver()
@@ -655,6 +679,38 @@ class Rule(object):
 		:rtype: bool
 		"""
 		return bool(self.evaluate(thing))
+
+	async def evaluate_async(self, thing):
+		"""
+		Evaluate the rule asynchronously against the specified *thing*. Supports coroutine resolvers and async
+		callables in expressions.
+
+		:param thing: The object on which to apply the rule.
+		:return: The value the rule evaluates to.
+		"""
+		self.context._tls.reset()
+		with decimal.localcontext(self.context.decimal_context):
+			return await self.statement.evaluate_async(thing)
+
+	async def matches_async(self, thing):
+		"""
+		Evaluate the rule asynchronously against the specified *thing*.
+
+		:param thing: The object on which to apply the rule.
+		:return: Whether or not the rule matches.
+		:rtype: bool
+		"""
+		return bool(await self.evaluate_async(thing))
+
+	async def filter_async(self, things):
+		"""
+		An async generator that yields each item in *things* for which :py:meth:`.matches_async` returns True.
+
+		:param things: The collection of objects to iterate over.
+		"""
+		for thing in things:
+			if await self.matches_async(thing):
+				yield thing
 
 	def to_graphviz(self):
 		"""

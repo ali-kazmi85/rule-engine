@@ -61,16 +61,16 @@ A lightweight, optionally typed expression language with a custom grammar for ma
 """
 
 setup(
-	name='rule-engine',
+	name='async-rule-engine',
 	version=version,
-	author='Spencer McIntyre',
-	author_email='zeroSteiner@gmail.com',
-	maintainer='Spencer McIntyre',
-	maintainer_email='zeroSteiner@gmail.com',
+	author='Ali Kazmi',
+	author_email='ali.kazmi@10pearls.com',
+	maintainer='Ali Kazmi',
+	maintainer_email='ali.kazmi@10pearls.com',
 	description=DESCRIPTION,
 	long_description=long_description,
 	long_description_content_type='text/x-rst',
-	url='https://github.com/zeroSteiner/rule-engine',
+	url='https://github.com/ali-kazmi85/rule-engine',
 	license='BSD',
 	# these are duplicated in requirements.txt
 	install_requires=[

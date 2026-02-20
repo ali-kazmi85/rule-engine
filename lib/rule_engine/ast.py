@@ -30,10 +30,12 @@
 #  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
+import asyncio
 import collections
 import collections.abc
 import datetime
 import functools
+import inspect
 import operator
 import re
 
@@ -111,6 +113,13 @@ class ASTNodeBase(object):
 		:return: The result of the evaluation as a native Python type.
 		"""
 		raise NotImplementedError()
+
+	async def evaluate_async(self, thing):
+		"""
+		Evaluate this AST node asynchronously. The default implementation delegates to the synchronous
+		:py:meth:`.evaluate` method; subclasses with async-capable children should override this.
+		"""
+		return self.evaluate(thing)
 
 	def reduce(self):
 		"""
@@ -210,6 +219,12 @@ class LiteralExpressionBase(ExpressionBase):
 class _CollectionMixin(object):
 	def evaluate(self, thing):
 		return self.result_type.python_type(member.evaluate(thing) for member in self.value)
+
+	async def evaluate_async(self, thing):
+		results = []
+		for member in self.value:
+			results.append(await member.evaluate_async(thing))
+		return self.result_type.python_type(results)
 
 	@property
 	def is_reduced(self):
@@ -311,6 +326,19 @@ class MappingExpression(LiteralExpressionBase):
 			mapping[key] = value.evaluate(thing)
 		return mapping
 
+	async def evaluate_async(self, thing):
+		mapping = collections.OrderedDict()
+		for key_expr, value_expr in self.value:
+			key = await key_expr.evaluate_async(thing)
+			key_type = DataType.from_value(key)
+			if key_type.is_compound and not isinstance(key_type, DataType.ARRAY.__class__):
+				raise errors.EngineError("the {} data type may not be used for mapping keys".format(key_type.name))
+			mapping[key] = value_expr
+		# defer value evaluation to avoid evaluating values of duplicate keys
+		for key in list(mapping.keys()):
+			mapping[key] = await mapping[key].evaluate_async(thing)
+		return mapping
+
 	@property
 	def is_reduced(self):
 		return all(_is_reduced(key, value) for key, value in self.value)
@@ -372,6 +400,7 @@ class LeftOperatorRightExpressionBase(ExpressionBase):
 		self._evaluator = getattr(self, '_op_' + type_, None)
 		if self._evaluator is None:
 			raise errors.EngineError('unsupported operator: ' + type_)
+		self._evaluator_async = getattr(self, '_op_' + type_ + '_async', None)
 		self._assert_type_is_compatible(left)
 		self.left = left
 		self._assert_type_is_compatible(right)
@@ -393,6 +422,11 @@ class LeftOperatorRightExpressionBase(ExpressionBase):
 
 	def evaluate(self, thing):
 		return self._evaluator(thing)
+
+	async def evaluate_async(self, thing):
+		if self._evaluator_async is not None:
+			return await self._evaluator_async(thing)
+		return self.evaluate(thing)
 
 	def reduce(self):
 		if not _is_reduced(self.left, self.right):
@@ -430,6 +464,23 @@ class AddExpression(LeftOperatorRightExpressionBase):
 	def _op_add(self, thing):
 		left_value = self.left.evaluate(thing)
 		right_value = self.right.evaluate(thing)
+		if isinstance(left_value, datetime.datetime):
+			if not isinstance(right_value, datetime.timedelta):
+				raise errors.EvaluationError('data type mismatch (not a timedelta value)')
+		elif isinstance(left_value, datetime.timedelta):
+			if not isinstance(right_value, (datetime.timedelta, datetime.datetime)):
+				raise errors.EvaluationError('data type mismatch (not a datetime or timedelta value)')
+		elif isinstance(left_value, bytes) or isinstance(right_value, bytes):
+			_assert_is_bytes(left_value, right_value)
+		elif isinstance(left_value, str) or isinstance(right_value, str):
+			_assert_is_string(left_value, right_value)
+		else:
+			_assert_is_numeric(left_value, right_value)
+		return operator.add(left_value, right_value)
+
+	async def _op_add_async(self, thing):
+		left_value = await self.left.evaluate_async(thing)
+		right_value = await self.right.evaluate_async(thing)
 		if isinstance(left_value, datetime.datetime):
 			if not isinstance(right_value, datetime.timedelta):
 				raise errors.EvaluationError('data type mismatch (not a timedelta value)')
@@ -485,6 +536,19 @@ class SubtractExpression(LeftOperatorRightExpressionBase):
 			_assert_is_numeric(left_value, right_value)
 		return operator.sub(left_value, right_value)
 
+	async def _op_sub_async(self, thing):
+		left_value = await self.left.evaluate_async(thing)
+		right_value = await self.right.evaluate_async(thing)
+		if isinstance(left_value, datetime.datetime):
+			if not isinstance(right_value, (datetime.datetime, datetime.timedelta)):
+				raise errors.EvaluationError('data type mismatch (not a datetime or timedelta value)')
+		elif isinstance(left_value, datetime.timedelta):
+			if not isinstance(right_value, datetime.timedelta):
+				raise errors.EvaluationError('data type mismatch (not a timedelta value)')
+		else:
+			_assert_is_numeric(left_value, right_value)
+		return operator.sub(left_value, right_value)
+
 class ArithmeticExpression(LeftOperatorRightExpressionBase):
 	"""A class for representing arithmetic expressions from the grammar text such as multiplication and division."""
 	compatible_types = (DataType.FLOAT,)
@@ -507,6 +571,25 @@ class ArithmeticExpression(LeftOperatorRightExpressionBase):
 	_op_mod  = functools.partialmethod(__op_arithmetic, operator.mod)
 	_op_mul  = functools.partialmethod(__op_arithmetic, operator.mul)
 	_op_pow  = functools.partialmethod(__op_arithmetic, operator.pow)
+
+	async def __op_arithmetic_async(self, op, thing):
+		left_value = await self.left.evaluate_async(thing)
+		_assert_is_numeric(left_value)
+		right_value = await self.right.evaluate_async(thing)
+		_assert_is_numeric(right_value)
+		try:
+			result = op(left_value, right_value)
+		except ZeroDivisionError:
+			raise errors.EvaluationError('arithmetic error: division by zero') from None
+		except ArithmeticError:
+			raise errors.EvaluationError('arithmetic error') from None
+		return result
+
+	_op_fdiv_async = functools.partialmethod(__op_arithmetic_async, operator.floordiv)
+	_op_tdiv_async = functools.partialmethod(__op_arithmetic_async, operator.truediv)
+	_op_mod_async  = functools.partialmethod(__op_arithmetic_async, operator.mod)
+	_op_mul_async  = functools.partialmethod(__op_arithmetic_async, operator.mul)
+	_op_pow_async  = functools.partialmethod(__op_arithmetic_async, operator.pow)
 
 class BitwiseExpression(LeftOperatorRightExpressionBase):
 	"""
@@ -555,6 +638,30 @@ class BitwiseExpression(LeftOperatorRightExpressionBase):
 	_op_bwor  = functools.partialmethod(_op_bitwise, operator.or_)
 	_op_bwxor = functools.partialmethod(_op_bitwise, operator.xor)
 
+	async def _op_bitwise_async(self, op, thing):
+		left = await self.left.evaluate_async(thing)
+		if DataType.from_value(left) == DataType.FLOAT:
+			return await self._op_bitwise_float_async(op, thing, left)
+		elif isinstance(DataType.from_value(left), DataType.SET.__class__):
+			return await self._op_bitwise_set_async(op, thing, left)
+		raise errors.EvaluationError('data type mismatch')
+
+	async def _op_bitwise_float_async(self, op, thing, left):
+		_assert_is_natural_number(left)
+		right = await self.right.evaluate_async(thing)
+		_assert_is_natural_number(right)
+		return coerce_value(op(int(left), int(right)))
+
+	async def _op_bitwise_set_async(self, op, thing, left):
+		right = await self.right.evaluate_async(thing)
+		if not DataType.is_compatible(DataType.from_value(right), DataType.SET):
+			raise errors.EvaluationError('data type mismatch')
+		return op(left, right)
+
+	_op_bwand_async = functools.partialmethod(_op_bitwise_async, operator.and_)
+	_op_bwor_async  = functools.partialmethod(_op_bitwise_async, operator.or_)
+	_op_bwxor_async = functools.partialmethod(_op_bitwise_async, operator.xor)
+
 class BitwiseShiftExpression(BitwiseExpression):
 	compatible_types = (DataType.FLOAT,)
 	result_type = DataType.FLOAT
@@ -563,6 +670,11 @@ class BitwiseShiftExpression(BitwiseExpression):
 	_op_bwlsh = functools.partialmethod(_op_bitwise_shift, operator.lshift)
 	_op_bwrsh = functools.partialmethod(_op_bitwise_shift, operator.rshift)
 
+	async def _op_bitwise_shift_async(self, *args, **kwargs):
+		return await self._op_bitwise_async(*args, **kwargs)
+	_op_bwlsh_async = functools.partialmethod(_op_bitwise_shift_async, operator.lshift)
+	_op_bwrsh_async = functools.partialmethod(_op_bitwise_shift_async, operator.rshift)
+
 class LogicExpression(LeftOperatorRightExpressionBase):
 	"""A class for representing logical expressions from the grammar text such as "and" and "or"."""
 	def _op_and(self, thing):
@@ -570,6 +682,18 @@ class LogicExpression(LeftOperatorRightExpressionBase):
 
 	def _op_or(self, thing):
 		return bool(self.left.evaluate(thing) or self.right.evaluate(thing))
+
+	async def _op_and_async(self, thing):
+		left = await self.left.evaluate_async(thing)
+		if not left:
+			return False
+		return bool(await self.right.evaluate_async(thing))
+
+	async def _op_or_async(self, thing):
+		left = await self.left.evaluate_async(thing)
+		if left:
+			return True
+		return bool(await self.right.evaluate_async(thing))
 
 ################################################################################
 # Left-Operator-Right Comparison Expressions
@@ -586,6 +710,20 @@ class ComparisonExpression(LeftOperatorRightExpressionBase):
 	def _op_ne(self, thing):
 		left_value = self.left.evaluate(thing)
 		right_value = self.right.evaluate(thing)
+		if type(left_value) is not type(right_value):
+			return True
+		return operator.ne(left_value, right_value)
+
+	async def _op_eq_async(self, thing):
+		left_value = await self.left.evaluate_async(thing)
+		right_value = await self.right.evaluate_async(thing)
+		if type(left_value) is not type(right_value):
+			return False
+		return operator.eq(left_value, right_value)
+
+	async def _op_ne_async(self, thing):
+		left_value = await self.left.evaluate_async(thing)
+		right_value = await self.right.evaluate_async(thing)
 		if type(left_value) is not type(right_value):
 			return True
 		return operator.ne(left_value, right_value)
@@ -629,6 +767,16 @@ class ArithmeticComparisonExpression(ComparisonExpression):
 	_op_le = functools.partialmethod(__op_arithmetic, operator.le)
 	_op_lt = functools.partialmethod(__op_arithmetic, operator.lt)
 
+	async def __op_arith_cmp_async(self, op, thing):
+		left_value = await self.left.evaluate_async(thing)
+		right_value = await self.right.evaluate_async(thing)
+		return self._ArithmeticComparisonExpression__op_arithmetic_values(op, left_value, right_value)
+
+	_op_ge_async = functools.partialmethod(__op_arith_cmp_async, operator.ge)
+	_op_gt_async = functools.partialmethod(__op_arith_cmp_async, operator.gt)
+	_op_le_async = functools.partialmethod(__op_arith_cmp_async, operator.le)
+	_op_lt_async = functools.partialmethod(__op_arith_cmp_async, operator.lt)
+
 class FuzzyComparisonExpression(ComparisonExpression):
 	"""
 	A class for representing regular expression comparison expressions from the grammar text such as search and does not
@@ -671,6 +819,30 @@ class FuzzyComparisonExpression(ComparisonExpression):
 	_op_ne_fzm = functools.partialmethod(__op_regex, 'match', operator.is_)
 	_op_ne_fzs = functools.partialmethod(__op_regex, 'search', operator.is_)
 
+	async def __op_regex_async(self, regex_function, modifier, thing):
+		left = await self.left.evaluate_async(thing)
+		if not isinstance(left, str) and left is not None:
+			raise errors.EvaluationError('data type mismatch')
+		if isinstance(self.right, StringExpression):
+			regex = self._right
+		else:
+			regex = await self.right.evaluate_async(thing)
+			if isinstance(regex, str):
+				regex = self._compile_regex(regex)
+			elif regex is not None:
+				raise errors.EvaluationError('data type mismatch')
+		if left is None or regex is None:
+			return not modifier(left, regex)
+		match = getattr(regex, regex_function)(left)
+		if match is not None:
+			self.context._tls.regex_groups = coerce_value(match.groups())
+		return modifier(match, None)
+
+	_op_eq_fzm_async = functools.partialmethod(__op_regex_async, 'match', operator.is_not)
+	_op_eq_fzs_async = functools.partialmethod(__op_regex_async, 'search', operator.is_not)
+	_op_ne_fzm_async = functools.partialmethod(__op_regex_async, 'match', operator.is_)
+	_op_ne_fzs_async = functools.partialmethod(__op_regex_async, 'search', operator.is_)
+
 ################################################################################
 # Miscellaneous Expressions
 ################################################################################
@@ -711,6 +883,18 @@ class ComprehensionExpression(ExpressionBase):
 					output_array.append(self.result.evaluate(thing))
 		return tuple(output_array)
 
+	async def evaluate_async(self, thing):
+		output_array = collections.deque()
+		input_iterable = await self.iterable.evaluate_async(thing)
+		if not DataType.from_value(input_iterable).is_iterable:
+			raise errors.EvaluationError('data type mismatch (comprehension requires an iterable)')
+		for value in input_iterable:
+			assignment = Assignment(self.variable, value=value)
+			with self.context.assignments(assignment):
+				if self.condition is None or await self.condition.evaluate_async(thing):
+					output_array.append(await self.result.evaluate_async(thing))
+		return tuple(output_array)
+
 	def to_graphviz(self, digraph, *args, **kwargs):
 		digraph.node(str(id(self)), "{}\nvariable={!r}".format(self.__class__.__name__, self.variable))
 		self.result.to_graphviz(digraph, *args, **kwargs)
@@ -746,6 +930,15 @@ class ContainsExpression(ExpressionBase):
 		container_value = self.container.evaluate(thing)
 		container_value_type = DataType.from_value(container_value)
 		member_value = self.member.evaluate(thing)
+		if container_value_type == DataType.BYTES or container_value_type == DataType.STRING:
+			if DataType.from_value(member_value) != container_value_type:
+				raise errors.EvaluationError('data type mismatch')
+		return bool(member_value in container_value)
+
+	async def evaluate_async(self, thing):
+		container_value = await self.container.evaluate_async(thing)
+		container_value_type = DataType.from_value(container_value)
+		member_value = await self.member.evaluate_async(thing)
 		if container_value_type == DataType.BYTES or container_value_type == DataType.STRING:
 			if DataType.from_value(member_value) != container_value_type:
 				raise errors.EvaluationError('data type mismatch')
@@ -825,6 +1018,32 @@ class GetAttributeExpression(ExpressionBase):
 			value = default_value
 		return self._new_value(value, verify_type=False)
 
+	async def evaluate_async(self, thing):
+		resolved_obj = await self.object.evaluate_async(thing)
+		if resolved_obj is None and self.safe:
+			return resolved_obj
+
+		attribute_error = None
+		try:
+			value = self.context.resolve_attribute(thing, resolved_obj, self.name)
+		except errors.AttributeResolutionError as error:
+			attribute_error = error
+		else:
+			return self._new_value(value, verify_type=False)
+
+		try:
+			value = await self.context.resolve_async(resolved_obj, self.name)
+		except errors.SymbolResolutionError as symbol_error:
+			default_value = self.context.default_value
+			if default_value is errors.UNDEFINED:
+				suggestion = attribute_error.suggestion or symbol_error.suggestion
+				if attribute_error.suggestion and symbol_error.suggestion:
+					suggestion = suggest_symbol(self.name, (attribute_error.suggestion, symbol_error.suggestion))
+				attribute_error.suggestion = suggestion
+				raise attribute_error from None
+			value = default_value
+		return self._new_value(value, verify_type=False)
+
 	def reduce(self):
 		if not _is_reduced(self.object):
 			return self
@@ -895,6 +1114,25 @@ class GetItemExpression(ExpressionBase):
 			raise errors.EvaluationError('data type mismatch (container is null)')
 
 		resolved_item = self.item.evaluate(thing)
+		if isinstance(resolved_obj, (bytes, str, tuple)):
+			_assert_is_integer_number(resolved_item)
+			resolved_item = int(resolved_item)
+		try:
+			value = operator.getitem(resolved_obj, resolved_item)
+		except (IndexError, KeyError):
+			if self.safe:
+				return None
+			raise errors.LookupError(resolved_obj, resolved_item)
+		return self._new_value(value, verify_type=False)
+
+	async def evaluate_async(self, thing):
+		resolved_obj = await self.container.evaluate_async(thing)
+		if resolved_obj is None:
+			if self.safe:
+				return resolved_obj
+			raise errors.EvaluationError('data type mismatch (container is null)')
+
+		resolved_item = await self.item.evaluate_async(thing)
 		if isinstance(resolved_obj, (bytes, str, tuple)):
 			_assert_is_integer_number(resolved_item)
 			resolved_item = int(resolved_item)
@@ -984,6 +1222,24 @@ class GetSliceExpression(ExpressionBase):
 		value = operator.getitem(resolved_obj, slice(resolved_start, resolved_stop))
 		return coerce_value(value, verify_type=False)
 
+	async def evaluate_async(self, thing):
+		resolved_obj = await self.container.evaluate_async(thing)
+		if resolved_obj is None:
+			if self.safe:
+				return resolved_obj
+			raise errors.EvaluationError('data type mismatch')
+
+		resolved_start = await self.start.evaluate_async(thing)
+		if resolved_start is not None:
+			_assert_is_integer_number(resolved_start)
+			resolved_start = int(resolved_start)
+		resolved_stop = await self.stop.evaluate_async(thing)
+		if resolved_stop is not None:
+			_assert_is_integer_number(resolved_stop)
+			resolved_stop = int(resolved_stop)
+		value = operator.getitem(resolved_obj, slice(resolved_start, resolved_stop))
+		return coerce_value(value, verify_type=False)
+
 	def reduce(self):
 		if not _is_reduced(self.container, self.start, self.stop):
 			return self
@@ -1026,6 +1282,41 @@ class SymbolExpression(ExpressionBase):
 	def evaluate(self, thing):
 		try:
 			value = self.context.resolve(thing, self.name, scope=self.scope)
+		except errors.SymbolResolutionError:
+			default_value = self.context.default_value
+			if default_value is errors.UNDEFINED:
+				raise
+			value = default_value
+		value = self._new_value(value, verify_type=False)
+
+		# if the expected result type is undefined, return the value
+		if self.result_type == DataType.UNDEFINED:
+			return value
+
+		# use DataType.from_value to raise a TypeError if value is not of a
+		# compatible data type
+		value_type = DataType.from_value(value)
+
+		# if the type is the expected result type, return the value
+		if DataType.is_compatible(value_type, self.result_type):
+			if self.result_type.is_scalar:
+				return value
+			if self.result_type.value_type == DataType.UNDEFINED:
+				return value
+			if self.result_type.value_type != DataType.NULL and not self.result_type.value_type_nullable and any(v is None for v in value):
+				raise errors.SymbolTypeError(self.name, is_value=value, is_type=value_type, expected_type=self.result_type)
+			if self.result_type.value_type == value_type.value_type:
+				return value
+
+		# if the type is null, return the value (treat null as a special case)
+		if value_type == DataType.NULL:
+			return value
+
+		raise errors.SymbolTypeError(self.name, is_value=value, is_type=value_type, expected_type=self.result_type)
+
+	async def evaluate_async(self, thing):
+		try:
+			value = await self.context.resolve_async(thing, self.name, scope=self.scope)
 		except errors.SymbolResolutionError:
 			default_value = self.context.default_value
 			if default_value is errors.UNDEFINED:
@@ -1105,6 +1396,32 @@ class FunctionCallExpression(ExpressionBase):
 			raise errors.FunctionCallError('function call failed (data type mismatch on returned value)', function_name=function_name)
 		return result
 
+	async def evaluate_async(self, thing):
+		function = await self.function.evaluate_async(thing)
+		if not callable(function):
+			raise errors.EvaluationError('data type mismatch (not a callable value)')
+		arguments = tuple([await argument.evaluate_async(thing) for argument in self.arguments])
+		function_name = '<unknown>'
+		if self.function.result_type != DataType.UNDEFINED:
+			function_type = self.function.result_type
+			function_name = function_type.value_name
+			self._validate_function(function_type, arguments)
+		elif hasattr(function, '__name__'):
+			function_name = function.__name__ + '?'
+		try:
+			result = function(*arguments)
+			if inspect.isawaitable(result):
+				result = await result
+		except errors.FunctionCallError as error:
+			error.function_name = function_name
+			raise error
+		except Exception as error:
+			raise errors.FunctionCallError('function call failed', error=error, function_name=function_name) from None
+		result = self._new_value(result)
+		if not DataType.is_compatible(DataType.from_value(result), self.result_type):
+			raise errors.FunctionCallError('function call failed (data type mismatch on returned value)', function_name=function_name)
+		return result
+
 	def _validate_function(self, function_type, arguments):
 		if not isinstance(function_type, DataType.FUNCTION.__class__):
 			raise errors.EvaluationError('data type mismatch (not a callable value)')
@@ -1160,6 +1477,9 @@ class Statement(ASTNodeBase):
 	def evaluate(self, thing):
 		return self.expression.evaluate(thing)
 
+	async def evaluate_async(self, thing):
+		return await self.expression.evaluate_async(thing)
+
 	def to_graphviz(self, digraph, *args, **kwargs):
 		super(Statement, self).to_graphviz(digraph, *args, **kwargs)
 		self.expression.to_graphviz(digraph, *args, **kwargs)
@@ -1198,6 +1518,11 @@ class TernaryExpression(ExpressionBase):
 	def evaluate(self, thing):
 		case = (self.case_true if self.condition.evaluate(thing) else self.case_false)
 		return case.evaluate(thing)
+
+	async def evaluate_async(self, thing):
+		condition = await self.condition.evaluate_async(thing)
+		case = self.case_true if condition else self.case_false
+		return await case.evaluate_async(thing)
 
 	def reduce(self):
 		if not _is_reduced(self.condition):
@@ -1247,6 +1572,15 @@ class UnaryExpression(ExpressionBase):
 
 	def evaluate(self, thing):
 		return self._evaluator(thing)
+
+	async def evaluate_async(self, thing):
+		right = await self.right.evaluate_async(thing)
+		if self.type == 'not':
+			return operator.not_(right)
+		# uminus
+		if not is_numeric(right) and not isinstance(right, datetime.timedelta):
+			raise errors.EvaluationError('data type mismatch (not a numeric or timedelta value)')
+		return operator.neg(right)
 
 	def __op(self, op, thing):
 		return op(self.right.evaluate(thing))

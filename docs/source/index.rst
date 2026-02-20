@@ -37,6 +37,7 @@ See the `examples`_ folder for more.
    :caption: Contents:
 
    getting_started.rst
+   async_support.rst
    syntax.rst
    types.rst
    attributes.rst

@@ -9,6 +9,7 @@ jobs:
     name: Test on Python v${{ matrix.python-version }}
     runs-on: ubuntu-22.04
     strategy:
+      fail-fast: false
       matrix:
         include:
           - pipenv-version: '2022.4.8'
@@ -59,7 +60,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install pipenv==${{ matrix.pipenv-version }}
-          pipenv install --dev
+          pipenv --python ${{ matrix.python-version }} install --dev
 
       - run: pipenv run tests
       - run: pipenv run tests-coverage
